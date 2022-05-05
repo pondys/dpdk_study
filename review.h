@@ -4,6 +4,7 @@
 #include <rte_ether.h>
 
 #define ARP_TYPE_DYNAMIC 0
+
 #define ARP_TYPE_STATIC 1
 
 //Á´±íÍ·²å
