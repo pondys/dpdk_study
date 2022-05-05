@@ -4,10 +4,9 @@
 #include <rte_ether.h>
 
 #define ARP_TYPE_DYNAMIC 0
-
 #define ARP_TYPE_STATIC 1
 
-//Á´±íÍ·²å
+//ÃÂ´Â±Ã­ÃÂ·Â²Ã¥
 #define L_H_ADD(item, list) do{\
 	item->prev = NULL;\
 	item->next = list;\
@@ -15,7 +14,7 @@
 	list = item;\
 } while(0)
 
-//É¾
+//Ã‰Â¾
 #define L_REMOVE(item, list) do{\
 	if (item->prev != NULL) item->prev->next = item->next;\
 	if (item->next != NULL) item->next->prev = item->prev;\
@@ -23,7 +22,7 @@
 	item->prev = item->next = NULL;\
 } while(0)
 
-//arp±í
+//arpÂ±Ã­
 struct ys_arp_entry
 {
     uint8_t type;
