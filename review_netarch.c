@@ -6,7 +6,7 @@
 #include <rte_malloc.h>
 #include <rte_timer.h>
 
-#include "review.h"
+#include "review_netarch.h"
 
 
 #define NUMBUFS  (8191)
@@ -15,8 +15,9 @@
 #define MAKE_IP(a, b, c, d) (a + (b<<8) + (c<<16) + (d<<24))
 #define TIMER_RESOLUTION_CYCLES 40000000000ULL
 
+#define RG_SIZE (1024)
 
-static uint32_t gLocalIp = MAKE_IP(192, 168, 0, 109);
+static uint32_t gLocalIp = MAKE_IP(192, 168, 43, 119);
 //ether mac 00; arp mac ff
 static uint8_t gDefaultArpLclMac[RTE_ETHER_ADDR_LEN] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
@@ -34,7 +35,46 @@ static const struct rte_eth_conf gPortConfDefault = {
 	.rxmode = {.max_rx_pkt_len = RTE_ETHER_MAX_LEN}
 };
 
+struct recv_send_ring{
+	struct rte_ring *recv;
+	struct rte_ring *send;
+};
+
 static struct ys_arp_table *gArp = NULL;
+static struct recv_send_ring *gRing = NULL;
+
+#if 1  //ring
+//ring表单例
+static struct recv_send_ring *ys_ring_get(void)
+{
+	if (NULL == gRing)
+	{
+	    gRing = rte_malloc("rcv/snd_ring", sizeof(struct recv_send_ring), 0);
+		if (NULL == gRing)
+		{
+		    rte_exit(EXIT_FAILURE, "Error in r/s ring get.\n");
+		}
+		memset(gRing, 0, sizeof(struct recv_send_ring));
+	}
+	return gRing;
+}
+
+static void ys_ring_init(struct recv_send_ring *ring)
+{
+	if (NULL == ring->recv)
+	{
+	    ring->recv = rte_ring_create("ys_recv_ring", RG_SIZE, rte_socket_id(), RING_F_SP_ENQ | RING_F_SC_DEQ);
+	}
+
+	if (NULL == ring->send)
+	{
+	    ring->send = rte_ring_create("ys_send_ring", RG_SIZE, rte_socket_id(), RING_F_SP_ENQ | RING_F_SC_DEQ);
+	}
+	return;
+}
+
+#endif
+
 
 #if 1  //basic
 static void ys_port_init(struct rte_mempool *mbuf_pool)
@@ -386,12 +426,15 @@ static struct rte_mbuf *ys_icmp_alloc(struct rte_mempool *mbuf_pool, uint8_t *ds
 }
 #endif
 
-int32_t main(int argc, char* argv[])
+#if 1  //包处理
+static int packet_process(void *arg)
 {
-    struct rte_mempool *mbuf_pool = NULL;
-	unsigned i = 0;
+	struct rte_mempool *mbuf_pool = (struct rte_mempool *)arg;
+	struct recv_send_ring *tmp_ring = ys_ring_get();
 	struct rte_mbuf *mbuf[BURST_SIZE];
-	unsigned recv_nb = 0;
+	unsigned nb_recv = 0;
+	unsigned i = 0;
+
 	struct rte_mbuf *abuf = NULL;
 	struct rte_mbuf *icmpbuf = NULL;
 	uint8_t *hwaddr = NULL;
@@ -409,8 +452,158 @@ int32_t main(int argc, char* argv[])
 	struct rte_udp_hdr *udphdr = NULL;
 
 	struct in_addr t_addr;
+
+	if (NULL == tmp_ring)
+	{
+	    rte_exit(EXIT_FAILURE, "Error in ring get during pkt process.\n");
+	}
+
+	while(1)
+	{
+		nb_recv = rte_ring_mc_dequeue_burst(tmp_ring->recv, (void **)mbuf, BURST_SIZE, NULL);
+
+		for (i = 0; i < nb_recv; i++)
+		{
+			//先解析eth头
+			ehdr = rte_pktmbuf_mtod(mbuf[i], struct rte_ether_hdr *);
+			if (rte_cpu_to_be_16(RTE_ETHER_TYPE_ARP) == ehdr->ether_type)
+			{
+				ahdr = rte_pktmbuf_mtod_offset(mbuf[i], struct rte_arp_hdr *, sizeof(struct rte_ether_hdr));
+
+				if (gLocalIp == ahdr->arp_data.arp_tip)
+				{
+					if (rte_cpu_to_be_16(RTE_ARP_OP_REQUEST) == ahdr->arp_opcode)
+					{
+						t_addr.s_addr = ahdr->arp_data.arp_tip;
+						printf("recv arp req local: %s, ", inet_ntoa(t_addr));
+
+						t_addr.s_addr = ahdr->arp_data.arp_sip;
+						printf("from: %s \n", inet_ntoa(t_addr));
+
+						//封装arp rsp并发出
+						abuf = ys_arp_alloc(mbuf_pool, RTE_ARP_OP_REPLY, ahdr->arp_data.arp_sha.addr_bytes, 
+											ahdr->arp_data.arp_tip, ahdr->arp_data.arp_sip);
+						rte_ring_mp_enqueue_burst(tmp_ring->send, (void**)&abuf, 1, NULL);
+					}
+					else if (rte_cpu_to_be_16(RTE_ARP_OP_REPLY) == ahdr->arp_opcode)
+					{
+						t_addr.s_addr = ahdr->arp_data.arp_tip;
+						printf("recv arp reply local: %s, ", inet_ntoa(t_addr));
+
+						t_addr.s_addr = ahdr->arp_data.arp_sip;
+						printf("from: %s \n", inet_ntoa(t_addr));
+
+						//遍历查找
+						t_arp_table = ys_arp_table_get();
+						hwaddr = ys_arp_dst_macaddr_get(ahdr->arp_data.arp_sip);
+						if (NULL == hwaddr)
+						{
+							t_entry = rte_malloc("ys arp entry", sizeof(struct ys_arp_entry), 0);
+							if (NULL == t_entry)
+							{
+								rte_exit(EXIT_FAILURE, "Error in entry alloc.\n");
+							}
+							memset(t_entry, 0x0, sizeof(struct ys_arp_entry));
+
+							t_entry->type = ARP_TYPE_DYNAMIC;
+							t_entry->ip = ahdr->arp_data.arp_sip;
+							rte_memcpy(t_entry->hwaddr, ahdr->arp_data.arp_sha.addr_bytes, RTE_ETHER_ADDR_LEN);
+
+							L_H_ADD(t_entry, t_arp_table->entries);
+							t_arp_table->count++;
+						}
+
+						//debug
+						for (iter = t_arp_table->entries; iter != NULL; iter = iter->next)
+						{
+							ys_print_ether_addr("arp entry --> mac: ", (struct rte_ether_addr *)iter->hwaddr);
+							t_addr.s_addr = iter->ip;
+							printf("ip: %s \n", inet_ntoa(t_addr));
+						}
+					}
+				}
+			}
+
+			//只处理ipv4
+			if (rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4) != ehdr->ether_type)
+			{
+				goto next;
+			}
+
+			iphdr = rte_pktmbuf_mtod_offset(mbuf[i], struct rte_ipv4_hdr *, sizeof(struct rte_ether_hdr));
+			if (IPPROTO_UDP == iphdr->next_proto_id)
+			{
+				udphdr = (struct rte_udp_hdr *)(iphdr + 1);
+
+				gSrcPort = udphdr->dst_port;
+				gDstPort = udphdr->src_port;
+				rte_memcpy(gDstMac, ehdr->s_addr.addr_bytes, RTE_ETHER_ADDR_LEN);
+				gSrcIp = iphdr->dst_addr;
+				gDstIp = iphdr->src_addr;
+
+				udp_len = ntohs(udphdr->dgram_len);
+				*((char*)udphdr + udp_len) = '\0';
+
+				//print
+				t_addr.s_addr = iphdr->dst_addr;
+				printf("recv udp local: %s:%d, ", inet_ntoa(t_addr), ntohs(udphdr->dst_port));
+
+				t_addr.s_addr = iphdr->src_addr;
+				printf("from: %s:%d, data(%d): %s\n", inet_ntoa(t_addr), ntohs(udphdr->src_port), 
+						udp_len, (char *)(udphdr + 1));
+
+				if (iphdr->src_addr == (uint32_t)(MAKE_IP(192, 168, 43, 173)))
+				{
+					//封装udp rsp并发出
+					udpbuf = ys_udp_alloc(mbuf_pool, (uint8_t *)(udphdr + 1), udp_len);
+					rte_ring_mp_enqueue_burst(tmp_ring->send, (void**)&udpbuf, 1, NULL);
+				}
+			}
+
+			if (IPPROTO_ICMP == iphdr->next_proto_id)
+			{
+				icmphdr = (struct rte_icmp_hdr *)(iphdr + 1);
+				if (RTE_IP_ICMP_ECHO_REQUEST == icmphdr->icmp_type && 
+					gLocalIp == iphdr->dst_addr)
+				{
+					t_addr.s_addr = iphdr->dst_addr;
+					printf("recv icmp req local: %s, ", inet_ntoa(t_addr));
+
+					t_addr.s_addr = iphdr->src_addr;
+					printf("from: %s \n", inet_ntoa(t_addr));
+
+					//封装icmp rsp并发出
+					icmpbuf = ys_icmp_alloc(mbuf_pool, ehdr->s_addr.addr_bytes, iphdr->dst_addr, 
+											iphdr->src_addr, icmphdr->icmp_ident, icmphdr->icmp_seq_nb);
+					rte_ring_mp_enqueue_burst(tmp_ring->send, (void**)&icmpbuf, 1, NULL);
+				}
+			}
+
+next:
+			rte_pktmbuf_free(mbuf[i]);
+		}
+
+	}
+	
+    return 0;
+}
+
+#endif
+
+int32_t main(int argc, char* argv[])
+{
+    struct rte_mempool *mbuf_pool = NULL;
+	unsigned i = 0;
+	unsigned recv_nb = 0;
+
 	static uint64_t prev_tsc = 0, cur_tsc;
 	uint64_t diff_tsc = 0;
+
+	struct recv_send_ring *tmp_ring = NULL;
+	unsigned lcore_id = rte_lcore_id();
+	struct rte_mbuf *rsv[BURST_SIZE];
+	struct rte_mbuf *snd[BURST_SIZE];
+	unsigned send_nb = 0;
 
 	//环境初始化
 	if(rte_eal_init(argc, argv) < 0)
@@ -435,137 +628,41 @@ int32_t main(int argc, char* argv[])
 	//定时器初始化
 	ys_arp_timer_init(mbuf_pool);
 
+	//ring
+	tmp_ring = ys_ring_get();
+	if (NULL == tmp_ring)
+	{
+	    rte_exit(EXIT_FAILURE, "Error in ring get.\n");
+	}
+	ys_ring_init(tmp_ring);
+
+	//启动处理线程
+	lcore_id = rte_get_next_lcore(lcore_id, 1, 0);
+	rte_eal_remote_launch(packet_process, mbuf_pool, lcore_id);
+
 	while (1)
 	{
-	    recv_nb = rte_eth_rx_burst(gDpdkPortId, 0, mbuf, BURST_SIZE);
+		//队列处理
+	    recv_nb = rte_eth_rx_burst(gDpdkPortId, 0, rsv, BURST_SIZE);
 		if (recv_nb > BURST_SIZE)
 		{
 		    rte_exit(EXIT_FAILURE, "Error in rx_burst.\n");
 		}
-
-		for (i = 0; i < recv_nb; i++)
+		else if (recv_nb > 0)
 		{
-		    //先解析eth头
-		    ehdr = rte_pktmbuf_mtod(mbuf[i], struct rte_ether_hdr *);
-			if (rte_cpu_to_be_16(RTE_ETHER_TYPE_ARP) == ehdr->ether_type)
-			{
-				ahdr = rte_pktmbuf_mtod_offset(mbuf[i], struct rte_arp_hdr *, sizeof(struct rte_ether_hdr));
-
-				if (gLocalIp == ahdr->arp_data.arp_tip)
-				{
-				    if (rte_cpu_to_be_16(RTE_ARP_OP_REQUEST) == ahdr->arp_opcode)
-				    {
-					    t_addr.s_addr = ahdr->arp_data.arp_tip;
-						printf("recv arp req local: %s, ", inet_ntoa(t_addr));
-
-						t_addr.s_addr = ahdr->arp_data.arp_sip;
-						printf("from: %s \n", inet_ntoa(t_addr));
-
-						//封装arp rsp并发出
-						abuf = ys_arp_alloc(mbuf_pool, RTE_ARP_OP_REPLY, ahdr->arp_data.arp_sha.addr_bytes, 
-											ahdr->arp_data.arp_tip, ahdr->arp_data.arp_sip);
-						rte_eth_tx_burst(gDpdkPortId, 0, &abuf, 1);
-						rte_pktmbuf_free(abuf);
-				    }
-					else if (rte_cpu_to_be_16(RTE_ARP_OP_REPLY) == ahdr->arp_opcode)
-					{
-					    t_addr.s_addr = ahdr->arp_data.arp_tip;
-						printf("recv arp reply local: %s, ", inet_ntoa(t_addr));
-
-						t_addr.s_addr = ahdr->arp_data.arp_sip;
-						printf("from: %s \n", inet_ntoa(t_addr));
-
-						//遍历查找
-						t_arp_table = ys_arp_table_get();
-						hwaddr = ys_arp_dst_macaddr_get(ahdr->arp_data.arp_sip);
-						if (NULL == hwaddr)
-						{
-						    t_entry = rte_malloc("ys arp entry", sizeof(struct ys_arp_entry), 0);
-							if (NULL == t_entry)
-							{
-							    rte_exit(EXIT_FAILURE, "Error in entry alloc.\n");
-							}
-							memset(t_entry, 0x0, sizeof(struct ys_arp_entry));
-
-							t_entry->type = ARP_TYPE_DYNAMIC;
-							t_entry->ip = ahdr->arp_data.arp_sip;
-							rte_memcpy(t_entry->hwaddr, ahdr->arp_data.arp_sha.addr_bytes, RTE_ETHER_ADDR_LEN);
-
-							L_H_ADD(t_entry, t_arp_table->entries);
-							t_arp_table->count++;
-						}
-
-						//debug
-						for (iter = t_arp_table->entries; iter != NULL; iter = iter->next)
-						{
-						    ys_print_ether_addr("arp entry --> mac: ", (struct rte_ether_addr *)iter->hwaddr);
-							t_addr.s_addr = iter->ip;
-							printf("ip: %s \n", inet_ntoa(t_addr));
-						}
-					}
-				}
-			}
-
-			//只处理ipv4
-			if (rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4) != ehdr->ether_type)
-			{
-			    goto next;
-			}
-
-			iphdr = rte_pktmbuf_mtod_offset(mbuf[i], struct rte_ipv4_hdr *, sizeof(struct rte_ether_hdr));
-			if (IPPROTO_UDP == iphdr->next_proto_id)
-			{
-			    udphdr = (struct rte_udp_hdr *)(iphdr + 1);
-
-				gSrcPort = udphdr->dst_port;
-				gDstPort = udphdr->src_port;
-				rte_memcpy(gDstMac, ehdr->s_addr.addr_bytes, RTE_ETHER_ADDR_LEN);
-				gSrcIp = iphdr->dst_addr;
-				gDstIp = iphdr->src_addr;
-
-				udp_len = ntohs(udphdr->dgram_len);
-				*((char*)udphdr + udp_len) = '\0';
-
-                //print
-				t_addr.s_addr = iphdr->dst_addr;
-				printf("recv udp local: %s:%d, ", inet_ntoa(t_addr), ntohs(udphdr->dst_port));
-
-				t_addr.s_addr = iphdr->src_addr;
-				printf("from: %s:%d, data(%d): %s\n", inet_ntoa(t_addr), ntohs(udphdr->src_port), 
-						udp_len, (char *)(udphdr + 1));
-
-                if (iphdr->src_addr == MAKE_IP(192, 168, 0, 108))
-                {
-					//封装udp rsp并发出
-					udpbuf = ys_udp_alloc(mbuf_pool, (uint8_t *)(udphdr + 1), udp_len);
-					rte_eth_tx_burst(gDpdkPortId, 0, &udpbuf, 1);
-					rte_pktmbuf_free(udpbuf);
-                }
-			}
-
-			if (IPPROTO_ICMP == iphdr->next_proto_id)
-			{
-			    icmphdr = (struct rte_icmp_hdr *)(iphdr + 1);
-				if (RTE_IP_ICMP_ECHO_REQUEST == icmphdr->icmp_type && 
-					gLocalIp == iphdr->dst_addr)
-				{
-					t_addr.s_addr = iphdr->dst_addr;
-					printf("recv icmp req local: %s, ", inet_ntoa(t_addr));
-
-					t_addr.s_addr = iphdr->src_addr;
-					printf("from: %s \n", inet_ntoa(t_addr));
-
-					//封装icmp rsp并发出
-					icmpbuf = ys_icmp_alloc(mbuf_pool, ehdr->s_addr.addr_bytes, iphdr->dst_addr, 
-											iphdr->src_addr, icmphdr->icmp_ident, icmphdr->icmp_seq_nb);
-					rte_eth_tx_burst(gDpdkPortId, 0, &icmpbuf, 1);
-					rte_pktmbuf_free(icmpbuf);
-				}
-			}
-
-next:
-			rte_pktmbuf_free(mbuf[i]);
+			rte_ring_sp_enqueue_burst(tmp_ring->recv, (void**)rsv, recv_nb, NULL);
 		}
+
+		send_nb = rte_ring_sc_dequeue_burst(tmp_ring->send, (void**)snd, BURST_SIZE, NULL);
+		if (send_nb > 0)
+		{
+			rte_eth_tx_burst(gDpdkPortId, 0, snd, send_nb);
+			for (i = 0; i < send_nb; i++)
+			{
+			    rte_pktmbuf_free(snd[i]);
+			}
+		}
+		
 
 		//timer start
 		cur_tsc = rte_rdtsc();
