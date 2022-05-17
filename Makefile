@@ -2,10 +2,10 @@
 # Copyright(c) 2010-2014 Intel Corporation
 
 # binary name
-APP = dpdk_rearp
+APP = dpdk_renetarch
 
 # all source are stored in SRCS-y
-SRCS-y := review.c
+SRCS-y := review_netarch.c
 
 # Build using pkg-config variables if possible
 ifeq ($(shell pkg-config --exists libdpdk && echo 0),0)
